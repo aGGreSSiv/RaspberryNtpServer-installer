@@ -286,10 +286,20 @@ curl http://localhost:9550/status.json
 
 ## Tested on
 
+Verified end-to-end (multiple full runs, including re-runs on an already
+configured system):
+
 - Raspberry Pi 4 Model B Rev 1.4, Raspberry Pi OS **Trixie**
   (Debian 13, kernel 6.18, 64-bit)
 - chrony 4.6.1, gpsd 3.25
-- u-blox NEO-6 class GPS module on `/dev/ttyS0` (UART), PPS on GPIO 4
+- u-blox NEO-6 class GPS module on `/dev/ttyS0` (UART), PPS via GPIO,
+  confirmed reaching **stratum 1 with an estimated error in the
+  nanosecond range**
+- Home Assistant status exporter + dashboard recipe
+
+Not yet tested on real hardware (code paths exist but feedback is
+welcome): USB-connected GPS modules, the optional LCD display step,
+Raspberry Pi 3 and Pi 5 specifics, Bookworm.
 
 ## Credits
 
