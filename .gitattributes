@@ -1,2 +1,3 @@
 *.sh text eol=lf
 gpstool text eol=lf
+ha/ntp-status-exporter text eol=lf

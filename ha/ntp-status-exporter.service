@@ -1,0 +1,13 @@
+[Unit]
+Description=NTP server status exporter (JSON/HTML for Home Assistant)
+After=network.target chrony.service gpsd.service
+
+[Service]
+Type=simple
+User=pi
+ExecStart=/usr/bin/python3 /usr/local/bin/ntp-status-exporter
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

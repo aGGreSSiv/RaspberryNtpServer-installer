@@ -33,6 +33,9 @@ handled automatically:
    schedule and UTC display are configurable. The display software is
    fetched from the upstream repository automatically.
 7. **gpstool** — installs the status menu to `/usr/local/bin/gpstool`.
+8. **Optional Home Assistant status exporter** — a tiny web service that
+   publishes the server's health as JSON for Home Assistant (see
+   [Home Assistant integration](#home-assistant-integration)).
 
 Safety properties:
 
@@ -124,6 +127,162 @@ run option 6 (`sourcestats`), read the `Offset` column of the GPS row,
 write it (in seconds) into the `refclock SHM 0 ... offset <value>` line of
 `/etc/chrony/chrony.conf` and restart chrony. Details in the
 [upstream guide](https://github.com/domschl/RaspberryNtpServer#synchronizing-the-offset-between-serial-time-information-and-pps).
+
+## Home Assistant integration
+
+The optional **status exporter** (installer step 8) lets you watch the NTP
+server live from a Home Assistant dashboard:
+
+![Home Assistant dashboard](images/ha-dashboard.png)
+
+### How it works
+
+The exporter is a small dependency-free Python service
+(`/usr/local/bin/ntp-status-exporter`, systemd unit `ntp-status-exporter`)
+that runs unprivileged on the Pi and serves on port **9550**:
+
+- `http://<ntp-server-ip>:9550/status.json` — machine-readable status:
+
+  ```json
+  {"fix": "3D", "sats_used": 8, "sats_seen": 13, "stratum": 1,
+   "reference": "50505330 (PPS0)", "offset_s": -4.4e-07,
+   "pps_locked": true, "est_error": "409ns",
+   "gpsd": "active", "chrony": "active", "updated": 1784297857}
+  ```
+
+- `http://<ntp-server-ip>:9550/` — a small auto-refreshing status page
+  (handy on a phone, or in a Home Assistant *Webpage* card).
+
+Home Assistant **pulls** this JSON with its built-in
+[`rest` integration](https://www.home-assistant.io/integrations/rest/) —
+nothing on the Pi needs to know about Home Assistant, no broker, no token.
+
+### Setup (change only the IP)
+
+**1.** Add this to your Home Assistant `configuration.yaml` and replace
+`192.168.1.2` with your NTP server's IP — that is the only edit needed:
+
+```yaml
+rest:
+  - resource: http://192.168.1.2:9550/status.json
+    scan_interval: 30
+    sensor:
+      - name: "NTP Server GPS Fix"
+        unique_id: ntpserver_gps_fix
+        icon: mdi:crosshairs-gps
+        value_template: "{{ value_json.fix }}"
+      - name: "NTP Server Satellites Used"
+        unique_id: ntpserver_sats_used
+        icon: mdi:satellite-variant
+        state_class: measurement
+        value_template: "{{ value_json.sats_used }}"
+      - name: "NTP Server Satellites Seen"
+        unique_id: ntpserver_sats_seen
+        icon: mdi:satellite-variant
+        state_class: measurement
+        value_template: "{{ value_json.sats_seen }}"
+      - name: "NTP Server Stratum"
+        unique_id: ntpserver_stratum
+        icon: mdi:clock-check-outline
+        value_template: "{{ value_json.stratum }}"
+      - name: "NTP Server Reference"
+        unique_id: ntpserver_reference
+        icon: mdi:clock-star-four-points-outline
+        value_template: "{{ value_json.reference }}"
+      - name: "NTP Server Offset"
+        unique_id: ntpserver_offset
+        icon: mdi:timer-sand
+        unit_of_measurement: "µs"
+        state_class: measurement
+        value_template: >-
+          {{ (value_json.offset_s * 1000000) | round(3)
+             if value_json.offset_s is not none else none }}
+      - name: "NTP Server Estimated Error"
+        unique_id: ntpserver_est_error
+        icon: mdi:plus-minus-variant
+        value_template: "{{ value_json.est_error }}"
+    binary_sensor:
+      - name: "NTP Server PPS Lock"
+        unique_id: ntpserver_pps_lock
+        device_class: connectivity
+        value_template: "{{ value_json.pps_locked }}"
+      - name: "NTP Server Services OK"
+        unique_id: ntpserver_services_ok
+        device_class: running
+        value_template: >-
+          {{ value_json.gpsd == 'active' and value_json.chrony == 'active' }}
+```
+
+**2.** Reload REST entities (Developer Tools → YAML → *RESTful entities
+and notify services*) or restart Home Assistant.
+
+**3.** Create a new dashboard (e.g. *NtpServer*), open its **raw
+configuration editor** and paste — no edits needed, the entity ids are
+derived from the sensor names above:
+
+```yaml
+views:
+  - title: NTP Server
+    path: ntpserver
+    icon: mdi:satellite-uplink
+    cards:
+      - type: glance
+        title: Stratum-1 NTP Server
+        entities:
+          - entity: binary_sensor.ntp_server_pps_lock
+            name: PPS Lock
+          - entity: sensor.ntp_server_stratum
+            name: Stratum
+          - entity: sensor.ntp_server_gps_fix
+            name: GPS Fix
+          - entity: binary_sensor.ntp_server_services_ok
+            name: Services
+      - type: gauge
+        entity: sensor.ntp_server_satellites_used
+        name: Satellites Used
+        min: 0
+        max: 20
+        severity:
+          red: 0
+          yellow: 4
+          green: 6
+      - type: entities
+        title: Details
+        entities:
+          - entity: sensor.ntp_server_satellites_seen
+            name: Satellites Seen
+          - entity: sensor.ntp_server_offset
+            name: System Time Offset
+          - entity: sensor.ntp_server_estimated_error
+            name: Estimated Error
+          - entity: sensor.ntp_server_reference
+            name: Reference Source
+      - type: history-graph
+        title: Offset History
+        hours_to_show: 24
+        entities:
+          - sensor.ntp_server_offset
+```
+
+Done — if the server is healthy you should see *PPS Lock: Connected*,
+*Stratum: 1* and *GPS Fix: 3D*. Since the sensors are regular Home
+Assistant entities, you also get history graphs for free and can build
+automations on them (e.g. notify when `binary_sensor.ntp_server_pps_lock`
+turns `off`).
+
+### Installing the exporter manually
+
+If you skipped step 8 during installation:
+
+```bash
+cd RaspberryNtpServer-installer
+sudo install -m 755 ha/ntp-status-exporter /usr/local/bin/
+sudo cp ha/ntp-status-exporter.service /etc/systemd/system/
+sudo sed -i "s/^User=.*/User=$USER/" /etc/systemd/system/ntp-status-exporter.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ntp-status-exporter
+curl http://localhost:9550/status.json
+```
 
 ## Tested on
 

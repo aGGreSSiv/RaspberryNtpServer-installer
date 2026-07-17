@@ -130,7 +130,7 @@ ask_yn "Continue?" y || { echo "Aborted."; exit 0; }
 
 # ---------- 1. GPS connection type ---------------------------------------
 
-log "Step 1/7: GPS module connection"
+log "Step 1/8: GPS module connection"
 ask_choice "How is the GPS module connected?" 1 \
     "USB (module has its own USB serial adapter, e.g. Keystudio GPS module)" \
     "Serial / UART (wired to GPIO 14/15, e.g. Adafruit GPS Hat, bare NEO-6 module)"
@@ -188,7 +188,7 @@ log "GPS device: ${GPS_DEVICE} (USBAUTO=${USBAUTO})"
 
 # ---------- 2. PPS setup --------------------------------------------------
 
-log "Step 2/7: PPS (pulse-per-second) signal"
+log "Step 2/8: PPS (pulse-per-second) signal"
 ask_value "GPIO pin the PPS signal is connected to" "4"
 PPS_PIN="$REPLY_VALUE"
 
@@ -200,14 +200,14 @@ REBOOT_REQUIRED=1
 
 # ---------- 3. Packages ---------------------------------------------------
 
-log "Step 3/7: Installing gpsd, chrony, pps-tools..."
+log "Step 3/8: Installing gpsd, chrony, pps-tools..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y gpsd gpsd-clients pps-tools chrony >/dev/null
 
 # ---------- 4. gpsd config -------------------------------------------------
 
-log "Step 4/7: Configuring gpsd for device ${GPS_DEVICE}"
+log "Step 4/8: Configuring gpsd for device ${GPS_DEVICE}"
 backup_once /etc/default/gpsd
 cat > /etc/default/gpsd <<EOF
 # Written by RaspberryNtpServer install.sh on $(date)
@@ -228,7 +228,7 @@ fi
 
 # ---------- 5. chrony config ------------------------------------------------
 
-log "Step 5/7: Configuring chrony"
+log "Step 5/8: Configuring chrony"
 find_chrony_conf
 backup_once "$CHRONY_CONF"
 
@@ -262,7 +262,7 @@ systemctl restart chrony 2>/dev/null || systemctl restart chronyd 2>/dev/null ||
 
 # ---------- 6. optional LCD display ----------------------------------------
 
-log "Step 6/7: Optional 4x20 I2C status display (chronotron)"
+log "Step 6/8: Optional 4x20 I2C status display (chronotron)"
 if ask_yn "Install the optional LCD status display?" n; then
     if command -v raspi-config >/dev/null; then
         raspi-config nonint do_i2c 0 || warn "Could not enable I2C automatically, enable it manually via raspi-config."
@@ -332,12 +332,38 @@ fi
 
 # ---------- 7. gpstool status menu ------------------------------------------
 
-log "Step 7/7: Installing 'gpstool' status menu to /usr/local/bin"
+log "Step 7/8: Installing 'gpstool' status menu to /usr/local/bin"
 if [ -f "${SCRIPT_DIR}/gpstool" ]; then
     install -m 755 "${SCRIPT_DIR}/gpstool" /usr/local/bin/gpstool
     log "Installed. Type 'gpstool' for an interactive GPS/PPS/NTP status menu."
 else
     warn "gpstool not found next to install.sh - skipping (copy it manually if needed)."
+fi
+
+# ---------- 8. optional Home Assistant status exporter -----------------------
+
+log "Step 8/8: Optional Home Assistant status exporter"
+echo "A small web service (port 9550) that publishes the server's health"
+echo "(GPS fix, satellites, PPS lock, stratum) as JSON for Home Assistant's"
+echo "'rest:' integration, plus a mini status web page. See README.md for"
+echo "the ready-made Home Assistant YAML."
+EXPORTER_INSTALLED=0
+if ask_yn "Install the Home Assistant status exporter?" n; then
+    if [ -f "${SCRIPT_DIR}/ha/ntp-status-exporter" ]; then
+        install -m 755 "${SCRIPT_DIR}/ha/ntp-status-exporter" /usr/local/bin/ntp-status-exporter
+        cp "${SCRIPT_DIR}/ha/ntp-status-exporter.service" /etc/systemd/system/
+        # Run the exporter as the invoking (non-root) user, not necessarily 'pi'
+        sed -i "s/^User=.*/User=${SUDO_USER:-pi}/" /etc/systemd/system/ntp-status-exporter.service
+        systemctl daemon-reload
+        systemctl enable --now ntp-status-exporter
+        EXPORTER_INSTALLED=1
+        PI_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+        log "Exporter running: http://${PI_IP:-<this-pi>}:9550/ (JSON at /status.json)"
+    else
+        warn "ha/ntp-status-exporter not found next to install.sh - skipping."
+    fi
+else
+    log "Skipping Home Assistant exporter."
 fi
 
 # ---------- summary ----------------------------------------------------
@@ -353,6 +379,9 @@ echo "  cgps                     # GPS fix"
 echo "  sudo ppstest /dev/pps0   # PPS pulses (after reboot)"
 echo "  chronyc sources          # NTP sources, look for #* PPS"
 echo "  chronyc sourcestats      # tune the GPS offset in ${CHRONY_CONF} if PPS stays unusable"
+if [ "$EXPORTER_INSTALLED" -eq 1 ]; then
+    echo "  curl http://localhost:9550/status.json   # Home Assistant exporter"
+fi
 
 if [ "$REBOOT_REQUIRED" -eq 1 ]; then
     echo

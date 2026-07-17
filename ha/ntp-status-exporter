@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""NTP status exporter for a GPS/PPS Stratum-1 NTP server.
+
+Serves the server's health (GPS fix, satellites, PPS lock, chrony stratum)
+as JSON on /status.json and as a small auto-refreshing HTML page on /.
+Designed to be polled by Home Assistant's `rest:` integration.
+
+Runs unprivileged; needs `chronyc` and `gpspipe` in PATH.
+"""
+
+import json
+import re
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = 9550
+REFRESH_SECONDS = 20
+
+_status_lock = threading.Lock()
+_status = {"error": "starting up"}
+
+
+def run(cmd, timeout):
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout
+        )
+        return out.stdout
+    except Exception:
+        return ""
+
+
+def service_active(name):
+    return run(["systemctl", "is-active", name], 5).strip() or "unknown"
+
+
+def collect():
+    status = {}
+
+    # --- GPS fix and satellite counts from raw NMEA via gpsd ---
+    nmea = run(["gpspipe", "-r", "-n", "40"], 12)
+    mode = used = seen = None
+    for line in nmea.splitlines():
+        f = line.split(",")
+        if "GSA," in line and len(f) > 3 and f[2].isdigit():
+            mode = int(f[2])
+        elif "GGA," in line and len(f) > 8 and f[7].isdigit():
+            used = int(f[7])
+        elif "GSV," in line and len(f) > 4 and f[3].isdigit():
+            seen = int(f[3])
+    status["fix"] = {2: "2D", 3: "3D"}.get(mode, "NO_FIX" if mode == 1 else "UNKNOWN")
+    status["sats_used"] = used if used is not None else 0
+    status["sats_seen"] = seen if seen is not None else 0
+
+    # --- chrony tracking: stratum, reference, system time offset ---
+    stratum = None
+    reference = None
+    offset_s = None
+    for line in run(["chronyc", "tracking"], 10).splitlines():
+        if line.startswith("Stratum"):
+            m = re.search(r":\s*(\d+)", line)
+            stratum = int(m.group(1)) if m else None
+        elif line.startswith("Reference ID"):
+            reference = line.split(":", 1)[1].strip()
+        elif line.startswith("System time"):
+            m = re.search(r":\s*([\d.]+) seconds (fast|slow)", line)
+            if m:
+                offset_s = float(m.group(1))
+                if m.group(2) == "slow":
+                    offset_s = -offset_s
+    status["stratum"] = stratum
+    status["reference"] = reference
+    status["offset_s"] = offset_s
+
+    # --- chrony sources: PPS lock + estimated error of the active source ---
+    pps_locked = False
+    est_error = None
+    for line in run(["chronyc", "sources"], 10).splitlines():
+        if line.startswith("#*"):
+            if "PPS" in line.split()[1]:
+                pps_locked = True
+            if "+/-" in line:
+                est_error = line.rsplit("+/-", 1)[1].strip()
+    status["pps_locked"] = pps_locked
+    status["est_error"] = est_error
+
+    status["gpsd"] = service_active("gpsd")
+    status["chrony"] = service_active("chrony")
+    status["updated"] = int(time.time())
+    return status
+
+
+def refresher():
+    global _status
+    while True:
+        try:
+            new = collect()
+        except Exception as e:  # never let the loop die
+            new = {"error": str(e), "updated": int(time.time())}
+        with _status_lock:
+            _status = new
+        time.sleep(REFRESH_SECONDS)
+
+
+PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>NTP Server Status</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+ body{font-family:system-ui,sans-serif;background:#111;color:#eee;
+      display:flex;justify-content:center;padding:2em}
+ table{border-collapse:collapse;min-width:22em}
+ td{padding:.45em .8em;border-bottom:1px solid #333}
+ td:first-child{color:#999}
+ .ok{color:#4c4}.bad{color:#e55}
+ h2{text-align:center}
+</style></head><body><div>
+<h2>&#128752; NTP Server Status</h2>
+<table id="t"></table>
+<script>
+async function tick(){
+  try{
+    const s = await (await fetch('/status.json')).json();
+    const ok = (c,txt) => `<span class="${c?'ok':'bad'}">${txt}</span>`;
+    document.getElementById('t').innerHTML = `
+      <tr><td>GPS fix</td><td>${ok(s.fix=='3D'||s.fix=='2D', s.fix)}</td></tr>
+      <tr><td>Satellites</td><td>${s.sats_used} used / ${s.sats_seen} seen</td></tr>
+      <tr><td>PPS lock</td><td>${ok(s.pps_locked, s.pps_locked?'LOCKED':'NOT LOCKED')}</td></tr>
+      <tr><td>Stratum</td><td>${ok(s.stratum==1, s.stratum ?? '?')}</td></tr>
+      <tr><td>Reference</td><td>${s.reference ?? '?'}</td></tr>
+      <tr><td>Offset</td><td>${s.offset_s==null?'?':(s.offset_s*1e6).toFixed(3)+' &micro;s'}</td></tr>
+      <tr><td>Est. error</td><td>${s.est_error ?? '?'}</td></tr>
+      <tr><td>Services</td><td>gpsd=${s.gpsd} chrony=${s.chrony}</td></tr>
+      <tr><td>Updated</td><td>${new Date(s.updated*1000).toLocaleTimeString()}</td></tr>`;
+  }catch(e){}
+}
+tick(); setInterval(tick, 10000);
+</script></div></body></html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/status.json":
+            with _status_lock:
+                body = json.dumps(_status).encode()
+            ctype = "application/json"
+        elif self.path == "/":
+            body = PAGE.encode()
+            ctype = "text/html; charset=utf-8"
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass  # quiet; systemd journal doesn't need per-request lines
+
+
+if __name__ == "__main__":
+    threading.Thread(target=refresher, daemon=True).start()
+    ThreadingHTTPServer(("", PORT), Handler).serve_forever()
