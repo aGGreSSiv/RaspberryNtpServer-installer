@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# gpstool - status menu for the GPS/PPS disciplined Stratum-1 NTP server
+# Part of the RaspberryNtpServer setup (https://github.com/domschl/RaspberryNtpServer)
+
+PPS_DEV="${PPS_DEV:-/dev/pps0}"
+
+bold()  { printf '\033[1m%s\033[0m\n' "$1"; }
+pause() { echo; read -r -p "Press Enter to return to the menu..." _; }
+
+health_summary() {
+    bold "=== Quick health summary ==="
+    echo
+    # GPS fix + satellite counts parsed from the raw NMEA stream via gpsd.
+    # (gpsd only emits SKY reports once satellites have full signal data,
+    # so NMEA parsing works in every state, even without an antenna.)
+    local stream mode sats used
+    echo "(sampling gpsd for up to 10 seconds...)"
+    stream="$(timeout 10 gpspipe -r -n 40 2>/dev/null)"
+    mode="$(grep 'GSA,' <<<"$stream" | tail -1 | awk -F, '{print $3}')"
+    used="$(grep 'GGA,' <<<"$stream" | tail -1 | awk -F, '{print $8}')"
+    sats="$(grep 'GSV,' <<<"$stream" | tail -1 | awk -F, '{print $4}')"
+    case "$mode" in
+        2) echo "GPS fix      : 2D FIX" ;;
+        3) echo "GPS fix      : 3D FIX" ;;
+        1) echo "GPS fix      : NO FIX (antenna connected and outdoors?)" ;;
+        *) echo "GPS fix      : UNKNOWN (is gpsd running and the GPS wired up?)" ;;
+    esac
+    if [ -n "$stream" ]; then
+        echo "Satellites   : ${used:-0} used / ${sats:-0} seen"
+    else
+        echo "Satellites   : no data from gpsd"
+    fi
+    # PPS: one pulse per second expected when the GPS has a fix
+    if sudo timeout 3 ppstest "$PPS_DEV" 2>/dev/null | grep -q "assert"; then
+        echo "PPS signal   : OK (pulses arriving on $PPS_DEV)"
+    else
+        echo "PPS signal   : NOT DETECTED (normal while there is no GPS fix)"
+    fi
+    # chrony: stratum + active source
+    local stratum ref
+    stratum="$(chronyc tracking 2>/dev/null | awk -F': *' '/^Stratum/{print $2}')"
+    ref="$(chronyc tracking 2>/dev/null | awk -F': *' '/^Reference ID/{print $2}')"
+    echo "NTP stratum  : ${stratum:-unknown}  (reference: ${ref:-unknown})"
+    if chronyc sources 2>/dev/null | grep -q '^#\* PPS'; then
+        echo "Time source  : GPS PPS locked - server is running as STRATUM 1"
+    else
+        echo "Time source  : network NTP fallback (PPS not locked yet)"
+    fi
+    # services
+    printf 'Services     : gpsd=%s chrony=%s\n' "$(systemctl is-active gpsd)" "$(systemctl is-active chrony)"
+}
+
+show_menu() {
+    clear 2>/dev/null || true
+    bold "======================================================"
+    bold "  gpstool - GPS / PPS / NTP server status menu"
+    bold "======================================================"
+    cat <<'EOF'
+
+  GPS
+   1) cgps            - live GPS view: fix status, satellites in use,
+                        signal strength, position (quit with 'q')
+   2) gpsmon          - low-level GPS monitor with raw NMEA sentences
+                        (quit with 'q' or Ctrl-C)
+
+  PPS
+   3) ppstest         - watch the pulse-per-second signal on /dev/pps0;
+                        'assert' + increasing sequence = PPS is working
+                        (stop with Ctrl-C)
+
+  NTP / chrony
+   4) chronyc tracking    - server stratum, reference source, precision
+                            (Stratum: 1 + Reference: PPS = perfect)
+   5) chronyc sources     - all time sources; '#* PPS0' means the server
+                            is locked to GPS PPS (stratum 1 mode)
+   6) chronyc sourcestats - source statistics; use the GPS 'Offset' column
+                            to tune the offset in /etc/chrony/chrony.conf
+
+  General
+   7) service status  - systemd status of gpsd and chrony
+   8) health summary  - one-shot overview: fix, satellites, PPS, stratum
+
+   0) quit
+
+EOF
+}
+
+while true; do
+    show_menu
+    read -r -p "Select an option: " choice
+    echo
+    case "$choice" in
+        1) cgps ;;
+        2) gpsmon ;;
+        3) echo "Watching $PPS_DEV (Ctrl-C to stop)..."; sudo ppstest "$PPS_DEV"; pause ;;
+        4) chronyc tracking; pause ;;
+        5) chronyc sources; pause ;;
+        6) chronyc sourcestats; pause ;;
+        7) systemctl status gpsd chrony --no-pager -l; pause ;;
+        8) health_summary; pause ;;
+        0|q|Q) echo "Bye."; exit 0 ;;
+        *) echo "Invalid option: '$choice'"; pause ;;
+    esac
+done

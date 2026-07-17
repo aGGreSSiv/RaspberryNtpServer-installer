@@ -1,0 +1,2 @@
+*.sh text eol=lf
+gpstool text eol=lf
